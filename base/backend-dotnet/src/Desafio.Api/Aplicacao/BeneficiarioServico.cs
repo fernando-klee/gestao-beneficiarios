@@ -1,0 +1,152 @@
+using Desafio.Api.Api.Contratos;
+using Desafio.Api.Dominio;
+using Desafio.Api.Infraestrutura;
+using Microsoft.EntityFrameworkCore;
+using Npgsql;
+
+namespace Desafio.Api.Aplicacao;
+
+public class BeneficiarioServico(AppDbContext db)
+{
+    private const string CodigoViolacaoDeUnicidade = "23505";
+
+    public async Task<BeneficiarioListResponse> ListarAsync(
+     int pagina,
+     int tamanho,
+     StatusBeneficiario? status,
+     Guid? planoId,
+     CancellationToken cancellationToken)
+    {
+        if (pagina < 1)
+            throw new ArgumentException("Pagina deve ser maior ou igual a 1", nameof(pagina));
+        if (tamanho < 1 || tamanho > 100)
+            throw new ArgumentException("Tamanho deve estar entre 1 e 100", nameof(tamanho));
+
+        var query = db.Beneficiarios
+            .AsNoTracking()
+            .Include(b => b.Plano)
+            .AsQueryable();
+
+        if (status.HasValue)
+            query = query.Where(b => b.Status == status.Value);
+        if (planoId.HasValue)
+            query = query.Where(b => b.PlanoId == planoId.Value);
+
+        query = query.OrderBy(b => b.NomeCompleto).ThenBy(b => b.Id);
+
+        var total = await query.CountAsync(cancellationToken);
+        var dados = await query
+            .Skip((pagina - 1) * tamanho)
+            .Take(tamanho)
+            .ToListAsync(cancellationToken);
+
+        var response = dados.Select(BeneficiarioResponse.De).ToList();
+        return new BeneficiarioListResponse(response, pagina, tamanho, total);
+    }
+
+    public async Task<Beneficiario> ObterPorIdAsync(Guid id, CancellationToken cancellationToken)
+    {
+        return await db.Beneficiarios
+            .Include(b => b.Plano)
+            .FirstOrDefaultAsync(b => b.Id == id, cancellationToken)
+            ?? throw new NaoEncontradoException("Beneficiário não encontrado");
+    }
+
+    public async Task<Beneficiario> CriarAsync(BeneficiarioRequest dados, CancellationToken cancellationToken)
+    {
+        var planoExiste = await db.Planos.AnyAsync(p => p.Id == dados.PlanoId, cancellationToken);
+        if (!planoExiste)
+            throw new ConflitoException(
+                "Plano não encontrado",
+                [new DetalheErro("plano_id", "inexistente")]
+            );
+
+        var beneficiario = new Beneficiario(
+            dados.NomeCompleto,
+            dados.Cpf,
+            dados.DataNascimento,
+            dados.PlanoId
+        );
+
+        await GarantirUnicidadeAsync(beneficiario, cancellationToken);
+
+        db.Beneficiarios.Add(beneficiario);
+        await SalvarAsync(cancellationToken);
+
+        await db.Entry(beneficiario).Reference(b => b.Plano).LoadAsync(cancellationToken);
+
+        return beneficiario;
+    }
+
+    public async Task<Beneficiario> AtualizarAsync(
+    Guid id,
+    BeneficiarioUpdateRequest dados,
+    CancellationToken cancellationToken)
+    {
+        var beneficiario = await ObterPorIdAsync(id, cancellationToken);
+
+        // Valida se o plano existe (422)
+        var planoExiste = await db.Planos.AnyAsync(p => p.Id == dados.PlanoId, cancellationToken);
+        if (!planoExiste)
+            throw new ConflitoException(
+                "Plano não encontrado",
+                [new DetalheErro("plano_id", "inexistente")]
+            );
+
+        beneficiario.AtualizarDados(
+            dados.NomeCompleto,
+            dados.DataNascimento,
+            dados.PlanoId,
+            dados.Status
+        );
+
+        await SalvarAsync(cancellationToken);
+        await db.Entry(beneficiario).Reference(b => b.Plano).LoadAsync(cancellationToken);
+
+        return beneficiario;
+    }
+
+    public async Task ExcluirAsync(Guid id, CancellationToken cancellationToken)
+    {
+        var beneficiario = await ObterPorIdAsync(id, cancellationToken);
+        beneficiario.Excluir();
+        await SalvarAsync(cancellationToken);
+    }
+
+    // Garantia de unicidade do CPF (consulta prévia)
+    private async Task GarantirUnicidadeAsync(Beneficiario beneficiario, CancellationToken cancellationToken)
+    {
+        var conflito = await db.Beneficiarios
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .Where(b => b.Id != beneficiario.Id)
+            .Where(b => b.Cpf == beneficiario.Cpf)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (conflito is not null)
+            throw new ConflitoException(
+                "CPF já cadastrado",
+                [new DetalheErro("cpf", "duplicado")]
+            );
+    }
+
+    // Captura violação de índice único (garantia real contra concorrência)
+    private async Task SalvarAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException excecao) when (EhViolacaoDeUnicidade(excecao))
+        {
+            throw new ConflitoException(
+                "CPF já cadastrado",
+                [new DetalheErro("cpf", "duplicado")]
+            );
+        }
+    }
+
+    private static bool EhViolacaoDeUnicidade(DbUpdateException excecao) =>
+        excecao.InnerException is PostgresException postgres &&
+        postgres.SqlState == CodigoViolacaoDeUnicidade;
+}
